@@ -1,11 +1,8 @@
-
 import os
 import json
-import chromadb
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
 from google import genai
 
 # =========================================================
@@ -15,11 +12,6 @@ from google import genai
 DATA_FILE = os.path.join(
     os.path.dirname(__file__),
     "schedule.json"
-)
-
-CHROMA_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "chroma_db"
 )
 
 # =========================================================
@@ -34,111 +26,87 @@ if not GEMINI_API_KEY:
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # =========================================================
-# Embeddings + ChromaDB
-# =========================================================
-
-embedding_model = SentenceTransformer(
-    "all-MiniLM-L6-v2"
-)
-
-chroma_client = chromadb.PersistentClient(
-    path=CHROMA_PATH
-)
-
-collection = chroma_client.get_or_create_collection(
-    name="schedule"
-)
-
-# =========================================================
 # Load schedule
 # =========================================================
+
+if not os.path.exists(DATA_FILE):
+    with open(DATA_FILE, "w") as f:
+        json.dump([], f)
 
 with open(DATA_FILE, "r") as f:
     events = json.load(f)
 
 
-def rebuild_chroma():
-
-    existing = collection.get()
-
-    if existing["ids"]:
-        collection.delete(ids=existing["ids"])
-
-    documents = []
-    ids = []
-    metadatas = []
-
-    for event in events:
-
-        document = (
-            f"Event: {event['title']}. "
-            f"Type: {event['type']}. "
-            f"Date: {event['date']}. "
-            f"Time: {event['start_time']} "
-            f"to {event['end_time']}. "
-            f"Description: {event.get('description', '')}"
-        )
-
-        documents.append(document)
-        ids.append(event["id"])
-
-        metadatas.append({
-            "event_id": event["id"],
-            "title": event["title"],
-            "type": event["type"],
-            "date": event["date"],
-            "start_time": event["start_time"],
-            "end_time": event["end_time"]
-        })
-
-    if documents:
-
-        embeddings = embedding_model.encode(
-            documents
-        ).tolist()
-
-        collection.add(
-            ids=ids,
-            documents=documents,
-            metadatas=metadatas,
-            embeddings=embeddings
-        )
-
-
-# Populate ChromaDB if empty
-if collection.count() == 0:
-    rebuild_chroma()
-
-
 # =========================================================
-# Tool 1: get_schedule
+# Lightweight RAG Retrieval
+# =========================================================
+# This replaces ChromaDB + SentenceTransformer.
+# It uses lightweight keyword-based retrieval so the app
+# can run within Render's 512 MB free memory limit.
 # =========================================================
 
 def get_schedule(query: str):
 
-    query_embedding = embedding_model.encode(
-        [query]
-    ).tolist()[0]
+    query = query.lower().strip()
 
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(5, collection.count())
+    if not query:
+        return []
+
+    query_words = set(query.split())
+
+    scored_events = []
+
+    for event in events:
+
+        searchable_text = " ".join([
+            str(event.get("title", "")),
+            str(event.get("type", "")),
+            str(event.get("date", "")),
+            str(event.get("start_time", "")),
+            str(event.get("end_time", "")),
+            str(event.get("description", ""))
+        ]).lower()
+
+        score = 0
+
+        # Exact query match gets higher priority
+        if query in searchable_text:
+            score += 10
+
+        # Word matching
+        for word in query_words:
+
+            # Ignore very small/common words
+            if len(word) <= 2:
+                continue
+
+            if word in searchable_text:
+                score += 1
+
+        if score > 0:
+            scored_events.append(
+                (score, event)
+            )
+
+    # Highest relevance first
+    scored_events.sort(
+        key=lambda item: item[0],
+        reverse=True
     )
 
     found = []
 
-    if results["metadatas"]:
+    for score, event in scored_events[:10]:
 
-        for metadata in results["metadatas"][0]:
-
-            found.append({
-                "event_id": metadata["event_id"],
-                "title": metadata["title"],
-                "type": metadata["type"],
-                "date": metadata["date"],
-                "start_time": metadata["start_time"],
-                "end_time": metadata["end_time"]
-            })
+        found.append({
+            "event_id": event.get("id"),
+            "title": event.get("title"),
+            "type": event.get("type"),
+            "date": event.get("date"),
+            "start_time": event.get("start_time"),
+            "end_time": event.get("end_time"),
+            "description": event.get("description", "")
+        })
 
     return found
 
@@ -160,9 +128,9 @@ def update_schedule(
 
     global events
 
-    # -------------------------
+    # =====================================================
     # ADD
-    # -------------------------
+    # =====================================================
 
     if action == "add":
 
@@ -174,7 +142,7 @@ def update_schedule(
                 numbers.append(
                     int(event["id"].split("_")[1])
                 )
-            except:
+            except Exception:
                 pass
 
         next_id = max(numbers, default=0) + 1
@@ -183,7 +151,7 @@ def update_schedule(
             "id": f"event_{next_id:03d}",
             "title": title or "Untitled Event",
             "type": event_type or "task",
-            "date": date,
+            "date": date or "",
             "start_time": start_time or "00:00",
             "end_time": end_time or "01:00",
             "description": description or ""
@@ -191,9 +159,9 @@ def update_schedule(
 
         events.append(new_event)
 
-    # -------------------------
+    # =====================================================
     # UPDATE
-    # -------------------------
+    # =====================================================
 
     elif action == "update":
 
@@ -201,7 +169,7 @@ def update_schedule(
 
         for event in events:
 
-            if event["id"] == event_id:
+            if event.get("id") == event_id:
                 target = event
                 break
 
@@ -229,9 +197,9 @@ def update_schedule(
         if description is not None:
             target["description"] = description
 
-    # -------------------------
+    # =====================================================
     # DELETE
-    # -------------------------
+    # =====================================================
 
     elif action == "delete":
 
@@ -240,7 +208,7 @@ def update_schedule(
         events = [
             event
             for event in events
-            if event["id"] != event_id
+            if event.get("id") != event_id
         ]
 
         if len(events) == original_length:
@@ -257,12 +225,16 @@ def update_schedule(
             "message": "Invalid action."
         }
 
-    # Save
-    with open(DATA_FILE, "w") as f:
-        json.dump(events, f, indent=2)
+    # =====================================================
+    # Save updated schedule
+    # =====================================================
 
-    # Synchronize vector database
-    rebuild_chroma()
+    with open(DATA_FILE, "w") as f:
+        json.dump(
+            events,
+            f,
+            indent=2
+        )
 
     return {
         "success": True,
@@ -272,15 +244,18 @@ def update_schedule(
 
 
 # =========================================================
-# Gemini tools
+# Gemini Tools
 # =========================================================
 
 SYSTEM_PROMPT = """
 You are an Agentic RAG Schedule Assistant.
 
-Manage the user's schedule for the next 30 days.
+You manage the user's schedule for the next 30 days.
 
-Use get_schedule whenever the user asks about:
+You have two tools:
+
+1. get_schedule
+Use this tool whenever the user asks about:
 - events
 - meetings
 - appointments
@@ -289,28 +264,39 @@ Use get_schedule whenever the user asks about:
 - dates
 - times
 - availability
+- what is scheduled
+- free time
 
-Use update_schedule when the user wants to:
+2. update_schedule
+Use this tool whenever the user wants to:
 - add an event
+- add a meeting
+- add an appointment
 - update an event
 - move an event
+- change an event
 - delete an event
+- cancel an event
 
-Never invent schedule information.
-
-Keep responses concise and useful.
+IMPORTANT:
+- Never invent schedule information.
+- Always use get_schedule before answering schedule questions.
+- If the user wants to update or delete an event and you need its ID, use get_schedule first.
+- After retrieving schedule information, use the event_id when updating or deleting.
+- Keep responses concise and useful.
 """
 
 TOOLS = [
     {
         "type": "function",
         "name": "get_schedule",
-        "description": "Retrieve relevant schedule information.",
+        "description": "Retrieve relevant schedule information from the user's schedule.",
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "The user's schedule question or search query."
                 }
             },
             "required": ["query"]
@@ -325,7 +311,11 @@ TOOLS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["add", "update", "delete"]
+                    "enum": [
+                        "add",
+                        "update",
+                        "delete"
+                    ]
                 },
                 "event_id": {
                     "type": "string"
@@ -374,6 +364,7 @@ def schedule_agent(user_query):
         if step.type == "function_call"
     ]
 
+    # No tool call
     if not calls:
         return interaction.output_text
 
@@ -382,6 +373,14 @@ def schedule_agent(user_query):
     for call in calls:
 
         args = call.arguments
+
+        # Handle JSON-string arguments if returned by SDK
+        if isinstance(args, str):
+
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
 
         if call.name == "get_schedule":
 
@@ -424,6 +423,7 @@ def schedule_agent(user_query):
             ]
         })
 
+    # Ask Gemini to produce the final answer
     final = client.interactions.create(
         model="gemini-3.6-flash",
         previous_interaction_id=interaction.id,
@@ -434,7 +434,7 @@ def schedule_agent(user_query):
 
 
 # =========================================================
-# FastAPI
+# FastAPI Application
 # =========================================================
 
 app = FastAPI(
@@ -442,20 +442,32 @@ app = FastAPI(
 )
 
 
+# =========================================================
+# Request Model
+# =========================================================
+
 class Query(BaseModel):
     query: str
 
+
+# =========================================================
+# Home Page
+# =========================================================
 
 @app.get("/", response_class=HTMLResponse)
 def home():
 
     return """
 <!DOCTYPE html>
+
 <html>
+
 <head>
+
 <title>Agentic RAG Schedule Assistant</title>
 
 <style>
+
 body {
     font-family: Arial, sans-serif;
     background: #f4f7fb;
@@ -526,7 +538,9 @@ button:hover {
     border-radius: 20px;
     cursor: pointer;
 }
+
 </style>
+
 </head>
 
 <body>
@@ -580,11 +594,15 @@ Add meeting
 
 </div>
 
+
 <script>
 
 function setQuery(text) {
+
     document.getElementById("query").value = text;
+
 }
+
 
 async function askAgent() {
 
@@ -595,8 +613,10 @@ async function askAgent() {
         document.getElementById("answer");
 
     if (!query) {
+
         answer.innerText =
             "Please enter a question.";
+
         return;
     }
 
@@ -627,19 +647,28 @@ async function askAgent() {
         answer.innerText =
             data.answer || data.error;
 
-    } catch (error) {
+    }
+
+    catch (error) {
 
         answer.innerText =
             "Unable to connect to the assistant.";
+
     }
+
 }
 
 </script>
 
 </body>
+
 </html>
 """
 
+
+# =========================================================
+# Health Check
+# =========================================================
 
 @app.get("/health")
 def health():
@@ -649,6 +678,10 @@ def health():
         "service": "Agentic RAG Schedule Assistant"
     }
 
+
+# =========================================================
+# Ask Endpoint
+# =========================================================
 
 @app.post("/ask")
 def ask(request: Query):
@@ -668,7 +701,10 @@ def ask(request: Query):
 
         error = str(e)
 
-        if "quota" in error.lower() or "429" in error:
+        if (
+            "quota" in error.lower()
+            or "429" in error
+        ):
 
             return {
                 "success": False,
