@@ -1,7 +1,7 @@
-
-fastapi
-uvicorn[standard]
-chromadb
-sentence-transformers
+Flask
 google-genai
 pydantic
+numpy
+scikit-learn
+python-dotenv
+gunicorn
