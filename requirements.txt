@@ -1,6 +1,4 @@
 fastapi
-uvicorn[standard]
-chromadb
-sentence-transformers
+uvicorn
 google-genai
 pydantic
